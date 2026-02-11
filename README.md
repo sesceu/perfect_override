@@ -38,6 +38,12 @@ Perfect Override is a single Go binary that:
 
 Build the binary from source:
 
+> [!TIP]
+> Check the `samples/` directory for a complete example of a corporate setup with personal overrides.
+
+> [!TIP]
+> Check the `samples/` directory for a complete example of a corporate setup with personal overrides.
+
 ```bash
 # In this directory
 go build -o perfect-override main.go
@@ -60,11 +66,28 @@ You can customize the workspace and config paths using flags:
 | `-workspace` | `.` | Path to the workspace folder (where `.git` lives) |
 | `-config` | `.devcontainer/devcontainer.json` | Path to the base corporate config (relative to `-workspace`) |
 | `-override` | `override.json` | Path to your personal override file (relative to CWD) |
+| `-name-prefix` | `pf` | Prefix for the container name (e.g., `pf-my-project`) |
 
 **Example:**
 ```bash
-./perfect-override -workspace ~/git/my-project -override ~/.config/my-overrides.json
+./perfect-override -workspace samples/basic-project -override samples/basic-project/override.json
 ```
+
+---
+
+### 🧪 Testing
+
+You can run the automated end-to-end test suite to verify the tool's functionality:
+
+```bash
+./tests/e2e_test.sh
+```
+
+This test will:
+1. Build the binary.
+2. Launch a sample project with overrides.
+3. Verify extensions, tool installation, and settings patching.
+4. Shut down the test container.
 
 ---
 

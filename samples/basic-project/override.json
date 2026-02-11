@@ -1,0 +1,27 @@
+{
+	"checks": {
+		"expectedRemoteUser": "vscode",
+		"expectedHomeDir": "/home/vscode"
+	},
+	"extensions": {
+		"add": [
+			"golang.go",
+			"martijnhols.jj-code"
+		],
+		"remove": [
+			"eamodio.gitlens"
+		]
+	},
+	"settings": {
+		"add": {
+			"editor.formatOnSave": true,
+			"git.enabled": false
+		}
+	},
+	"symlinks": [],
+	"aptPackages": [
+		"ripgrep",
+		"fzf",
+		"htop"
+	]
+}

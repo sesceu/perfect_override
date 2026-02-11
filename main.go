@@ -42,12 +42,14 @@ var (
 	workspaceDir   string
 	devcontainer   string
 	overrideConfig string
+	namePrefix     string
 )
 
 func main() {
 	flag.StringVar(&workspaceDir, "workspace", ".", "Path to the workspace folder")
 	flag.StringVar(&devcontainer, "config", ".devcontainer/devcontainer.json", "Path to the base devcontainer.json")
 	flag.StringVar(&overrideConfig, "override", "override.json", "Path to the override.json config")
+	flag.StringVar(&namePrefix, "name-prefix", "pf", "Prefix for the dev container name")
 	flag.Parse()
 
 	fmt.Println("🚀 Starting DevContainer Manager...")
@@ -58,6 +60,17 @@ func main() {
 
 	// 2. CHECK ASSUMPTIONS
 	checkAssumptions(baseMap, pConfig)
+
+	// 2b. APPLY DYNAMIC NAME
+	absWorkspace, err := filepath.Abs(workspaceDir)
+	if err != nil {
+		fmt.Printf("❌ Could not determine absolute path for workspace: %v\n", err)
+		os.Exit(1)
+	}
+	folderName := filepath.Base(absWorkspace)
+	effectiveName := fmt.Sprintf("%s-%s", namePrefix, folderName)
+	baseMap["name"] = effectiveName
+	fmt.Printf("🏷️  Container Name: %s\n", effectiveName)
 
 	// 3. PREPARE EFFECTIVE CONFIG
 	effectivePath := filepath.Join(workspaceDir, ".devcontainer.json")
@@ -85,6 +98,10 @@ func main() {
 
 	// CREATE SYMLINKS
 	createSymlinks(pConfig.Symlinks, pConfig.Checks.ExpectedHomeDir, workspaceDir, effectivePath)
+
+	// 6. CLEANUP (Zero Trace)
+	fmt.Println("🧹 Cleaning up temporary config...")
+	_ = os.Remove(effectivePath)
 
 	fmt.Println("✅ DONE! Connect to Port 2222.")
 }
