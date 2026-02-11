@@ -1,7 +1,8 @@
 {
+  // This is a corporate standard env
   "name": "Corporate Standard Env",
   "build": {
-    "dockerfile": ".devcontainer/Dockerfile"
+    "dockerfile": "Dockerfile"
   },
   "remoteUser": "vscode",
   "customizations": {

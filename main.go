@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 )
 
@@ -26,8 +27,17 @@ type PersonalConfig struct {
 		Add    map[string]interface{} `json:"add"`
 		Remove []string               `json:"remove"`
 	} `json:"settings"`
-	Symlinks    []Symlink `json:"symlinks"`
-	AptPackages []string  `json:"aptPackages"`
+	Symlinks []Symlink `json:"symlinks"`
+	AptPackages struct {
+		Add    []string `json:"add"`
+		Remove []string `json:"remove"`
+	} `json:"aptPackages"`
+	Commands []string `json:"commands"`
+	HostHomeMount string `json:"hostHomeMount"`
+	Features struct {
+		Add    map[string]interface{} `json:"add"`
+		Remove []string               `json:"remove"`
+	} `json:"features"`
 }
 
 type Symlink struct {
@@ -36,68 +46,92 @@ type Symlink struct {
 }
 
 // --- CONSTANTS ---
-const HostMountPoint = "/host_home"
+const DefaultHostMountPoint = "/host_home"
 
 var (
 	workspaceDir   string
 	devcontainer   string
 	overrideConfig string
-	namePrefix     string
 )
+
+func fixRelativePaths(base map[string]interface{}, baseConfigPath string) {
+	build, ok := base["build"].(map[string]interface{})
+	if !ok { return }
+	
+	dockerfile, ok := build["dockerfile"].(string)
+	if !ok { return }
+	
+	if !filepath.IsAbs(dockerfile) {
+		absConfigPath, _ := filepath.Abs(baseConfigPath)
+		// The dockerfile path in devcontainer.json is relative to the config file itself.
+		absDockerfile := filepath.Join(filepath.Dir(absConfigPath), dockerfile)
+		build["dockerfile"] = absDockerfile
+		fmt.Printf("📍 Absolutized Dockerfile: %s\n", absDockerfile)
+	}
+}
 
 func main() {
 	flag.StringVar(&workspaceDir, "workspace", ".", "Path to the workspace folder")
 	flag.StringVar(&devcontainer, "config", ".devcontainer/devcontainer.json", "Path to the base devcontainer.json")
 	flag.StringVar(&overrideConfig, "override", "override.json", "Path to the override.json config")
-	flag.StringVar(&namePrefix, "name-prefix", "pf", "Prefix for the dev container name")
 	flag.Parse()
 
 	fmt.Println("🚀 Starting DevContainer Manager...")
 
 	// 1. LOAD CONFIGS
 	pConfig := loadPersonalConfig(overrideConfig)
-	baseMap := loadBaseConfig(filepath.Join(workspaceDir, devcontainer))
+	
+	// Ensure we have absolute paths for everything to avoid relative path hell
+	absWorkspace, _ := filepath.Abs(workspaceDir)
+	baseConfigPath := filepath.Join(absWorkspace, devcontainer)
+	baseMap := loadBaseConfig(baseConfigPath)
 
 	// 2. CHECK ASSUMPTIONS
 	checkAssumptions(baseMap, pConfig)
 
 	// 2b. APPLY DYNAMIC NAME
-	absWorkspace, err := filepath.Abs(workspaceDir)
-	if err != nil {
-		fmt.Printf("❌ Could not determine absolute path for workspace: %v\n", err)
-		os.Exit(1)
-	}
 	folderName := filepath.Base(absWorkspace)
-	effectiveName := fmt.Sprintf("%s-%s", namePrefix, folderName)
+	effectiveName := fmt.Sprintf("%s-%s", "pf", folderName)
 	baseMap["name"] = effectiveName
 	fmt.Printf("🏷️  Container Name: %s\n", effectiveName)
 
 	// 3. PREPARE EFFECTIVE CONFIG
-	effectivePath := filepath.Join(workspaceDir, ".devcontainer.json")
+	// Note: The devcontainer CLI is extremely strict: the config MUST be named 
+	// 'devcontainer.json' or '.devcontainer.json'. 
+	// To preserve the corporate file, we use '.devcontainer.json' at the workspace root.
+	effectiveFile := ".devcontainer.json"
+	effectivePath := filepath.Join(absWorkspace, effectiveFile)
+	
+	fixRelativePaths(baseMap, baseConfigPath)
 	applyExtensionChanges(baseMap, pConfig)
-	injectHostMount(baseMap)
+	applyFeatureChanges(baseMap, pConfig)
+	injectHostMount(baseMap, pConfig)
 	saveJSON(effectivePath, baseMap)
-	addToGitIgnore(workspaceDir, ".devcontainer.json")
+	addToGitIgnore(absWorkspace, effectiveFile)
 
 	// 4. LAUNCH CONTAINER
 	fmt.Println("🐳 Launching Container...")
-	runCommand("devcontainer", "up",
-		"--config", effectivePath,
-		"--workspace-folder", workspaceDir,
+	runCommand(absWorkspace, "devcontainer", "up",
+		"--config", effectiveFile,
+		"--workspace-folder", ".",
 	)
 
 	// 5. PROVISIONING
 	fmt.Println("⚙️  Provisioning Environment...")
 	
-	if len(pConfig.AptPackages) > 0 {
-		installAptPackages(pConfig.AptPackages, workspaceDir, effectivePath)
+	if len(pConfig.AptPackages.Add) > 0 || len(pConfig.AptPackages.Remove) > 0 {
+		installAptPackages(pConfig.AptPackages, ".", effectiveFile, absWorkspace)
+	}
+
+	if len(pConfig.Commands) > 0 {
+		runCustomCommands(pConfig.Commands, ".", effectiveFile, absWorkspace)
 	}
 
 	// PATCH SETTINGS (Read -> Modify -> Write)
-	patchMachineSettings(pConfig, pConfig.Checks.ExpectedRemoteUser, workspaceDir, effectivePath)
+	patchMachineSettings(pConfig, pConfig.Checks.ExpectedRemoteUser, ".", effectiveFile, absWorkspace)
 
 	// CREATE SYMLINKS
-	createSymlinks(pConfig.Symlinks, pConfig.Checks.ExpectedHomeDir, workspaceDir, effectivePath)
+	createSymlinks(pConfig, pConfig.Checks.ExpectedHomeDir, ".", effectiveFile, absWorkspace)
 
 	// 6. CLEANUP (Zero Trace)
 	fmt.Println("🧹 Cleaning up temporary config...")
@@ -108,18 +142,19 @@ func main() {
 
 // --- CORE LOGIC ---
 
-func patchMachineSettings(pConfig PersonalConfig, user string, workspace string, config string) {
+func patchMachineSettings(pConfig PersonalConfig, user string, workspace string, config string, cwd string) {
 	targetDir := fmt.Sprintf("/home/%s/.vscode-server/data/Machine", user)
 	targetFile := filepath.Join(targetDir, "settings.json")
 
 	fmt.Println("📝 Patching VS Code settings...")
 
 	// A. Ensure Dir Exists
-	runCommand("devcontainer", "exec", "--config", config, "--workspace-folder", workspace, "mkdir", "-p", targetDir)
+	runCommand(cwd, "devcontainer", "exec", "--config", config, "--workspace-folder", workspace, "mkdir", "-p", targetDir)
 
 	// B. Read Existing Settings (if any)
 	// We use 'cat' via exec. If file fails, we assume empty JSON object.
 	cmd := exec.Command("devcontainer", "exec", "--config", config, "--workspace-folder", workspace, "cat", targetFile)
+	cmd.Dir = cwd
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	_ = cmd.Run() // Ignore error (file might not exist)
@@ -143,25 +178,48 @@ func patchMachineSettings(pConfig PersonalConfig, user string, workspace string,
 	// E. Write Back
 	jsonBytes, _ := json.MarshalIndent(currentSettings, "", "  ")
 	writeCmd := fmt.Sprintf("cat > %s <<EOF\n%s\nEOF", targetFile, string(jsonBytes))
-	runCommand("devcontainer", "exec", "--config", config, "--workspace-folder", workspace, "bash", "-c", writeCmd)
+	runCommand(cwd, "devcontainer", "exec", "--config", config, "--workspace-folder", workspace, "bash", "-c", writeCmd)
 }
 
-func createSymlinks(links []Symlink, homeDir string, workspace string, config string) {
-	for _, link := range links {
-		srcPath := filepath.Join(HostMountPoint, link.Source)
-		tgtPath := filepath.Join(homeDir, link.Target)
+func createSymlinks(pConfig PersonalConfig, homeDir string, workspace string, config string, cwd string) {
+	mountPoint := pConfig.HostHomeMount
+	if mountPoint == "" {
+		mountPoint = DefaultHostMountPoint
+	}
+
+	for _, link := range pConfig.Symlinks {
+		srcPath := filepath.Join(mountPoint, link.Source)
+		tgtPath := link.Target
+		if !filepath.IsAbs(tgtPath) {
+			tgtPath = filepath.Join(homeDir, link.Target)
+		}
 		tgtDir := filepath.Dir(tgtPath)
 
 		fmt.Printf("🔗 Linking %s -> %s\n", link.Source, link.Target)
 		
-		// 1. Ensure target directory exists
-		// 2. Remove existing file/link at target (ln -sf isn't always enough if it's a directory)
-		// 3. Create symlink
+		// We use sudo for everything here because targets like /usr/local/bin 
+		// or /home/builder/.intrinsic/bin might have restricted permissions or be mounts.
 		script := fmt.Sprintf(
-			"mkdir -p %s && rm -rf %s && ln -sf %s %s", 
+			"sudo mkdir -p %s && sudo rm -rf %s && sudo ln -sf %s %s", 
 			tgtDir, tgtPath, srcPath, tgtPath,
 		)
-		runCommand("devcontainer", "exec", "--config", config, "--workspace-folder", workspace, "bash", "-c", script)
+		
+		// Capture output to check for "Read-only file system"
+		cmd := exec.Command("devcontainer", "exec", "--config", config, "--workspace-folder", workspace, "bash", "-c", script)
+		cmd.Dir = cwd
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		err := cmd.Run()
+
+		if err != nil {
+			errStr := stderr.String()
+			if strings.Contains(errStr, "Read-only file system") {
+				fmt.Printf("⚠️  Warning: Could not create symlink %s (Read-only file system). Skipping.\n", link.Target)
+			} else {
+				fmt.Printf("❌ Failed to create symlink %s: %v\n%s\n", link.Target, err, errStr)
+				// We don't exit here to allow other provisioning to potentially succeed
+			}
+		}
 	}
 }
 
@@ -198,8 +256,31 @@ func applyExtensionChanges(base map[string]interface{}, pConfig PersonalConfig) 
 	vscode["extensions"] = finalList
 }
 
-func injectHostMount(base map[string]interface{}) {
-	mountString := fmt.Sprintf("source=${localEnv:HOME},target=%s,type=bind,consistency=cached", HostMountPoint)
+func applyFeatureChanges(base map[string]interface{}, pConfig PersonalConfig) {
+	// Initialize features map if missing
+	features, ok := base["features"].(map[string]interface{})
+	if !ok {
+		features = make(map[string]interface{})
+		base["features"] = features
+	}
+
+	// 1. Apply Removals
+	for _, id := range pConfig.Features.Remove {
+		delete(features, id)
+	}
+
+	// 2. Apply Adds/Overrides
+	for id, val := range pConfig.Features.Add {
+		features[id] = val
+	}
+}
+
+func injectHostMount(base map[string]interface{}, pConfig PersonalConfig) {
+	mountPoint := pConfig.HostHomeMount
+	if mountPoint == "" {
+		mountPoint = DefaultHostMountPoint
+	}
+	mountString := fmt.Sprintf("source=${localEnv:HOME},target=%s,type=bind,consistency=cached", mountPoint)
 	mounts := []interface{}{}
 	if existing, ok := base["mounts"].([]interface{}); ok {
 		mounts = existing
@@ -219,14 +300,45 @@ func checkAssumptions(base map[string]interface{}, pConfig PersonalConfig) {
 	}
 }
 
-func installAptPackages(pkgs []string, workspace string, config string) {
-	fmt.Printf("📦 Installing packages: %v\n", pkgs)
-	pkgList := strings.Join(pkgs, " ")
-	script := fmt.Sprintf("sudo apt-get update && sudo apt-get install -y %s", pkgList)
-	runCommand("devcontainer", "exec", "--config", config, "--workspace-folder", workspace, "bash", "-c", script)
+func installAptPackages(apt struct {
+	Add    []string `json:"add"`
+	Remove []string `json:"remove"`
+}, workspace string, config string, cwd string) {
+	if len(apt.Remove) > 0 {
+		fmt.Printf("�️ Removing packages: %v\n", apt.Remove)
+		pkgList := strings.Join(apt.Remove, " ")
+		script := fmt.Sprintf("sudo apt-get remove -y %s", pkgList)
+		runCommand(cwd, "devcontainer", "exec", "--config", config, "--workspace-folder", workspace, "bash", "-c", script)
+	}
+	if len(apt.Add) > 0 {
+		fmt.Printf("�📦 Installing packages: %v\n", apt.Add)
+		pkgList := strings.Join(apt.Add, " ")
+		script := fmt.Sprintf("sudo apt-get update && sudo apt-get install -y %s", pkgList)
+		runCommand(cwd, "devcontainer", "exec", "--config", config, "--workspace-folder", workspace, "bash", "-c", script)
+	}
+}
+
+func runCustomCommands(commands []string, workspace string, config string, cwd string) {
+	fmt.Println("🛠️ Running custom commands...")
+	for _, cmd := range commands {
+		fmt.Printf("  > %s\n", cmd)
+		runCommand(cwd, "devcontainer", "exec", "--config", config, "--workspace-folder", workspace, "bash", "-c", cmd)
+	}
 }
 
 // --- BOILERPLATE UTILS ---
+
+func stripComments(data []byte) []byte {
+	// Remove single-line comments // ... but only if preceded by space or start of line
+	// (Avoids stripping https://URLs)
+	reSingle := regexp.MustCompile(`(?m)(^|\s)//.*$`)
+	// Remove multi-line comments /* ... */
+	reMulti := regexp.MustCompile(`(?s)/\*.*?\*/`)
+	
+	res := reMulti.ReplaceAll(data, []byte(""))
+	res = reSingle.ReplaceAll(res, []byte("$1")) // Preserve the prefixing whitespace
+	return res
+}
 
 func loadPersonalConfig(path string) PersonalConfig {
 	file, err := os.ReadFile(path)
@@ -234,16 +346,27 @@ func loadPersonalConfig(path string) PersonalConfig {
 		fmt.Printf("❌ Could not read %s.\n", path)
 		os.Exit(1)
 	}
+	cleanJSON := stripComments(file)
 	var config PersonalConfig
-	if err := json.Unmarshal(file, &config); err != nil { panic(err) }
+	if err := json.Unmarshal(cleanJSON, &config); err != nil {
+		fmt.Printf("❌ Failed to parse %s: %v\n", path, err)
+		os.Exit(1)
+	}
 	return config
 }
 
 func loadBaseConfig(path string) map[string]interface{} {
 	file, err := os.ReadFile(path)
-	if err != nil { panic(err) }
+	if err != nil {
+		fmt.Printf("❌ Could not read base config %s: %v\n", path, err)
+		os.Exit(1)
+	}
+	cleanJSON := stripComments(file)
 	var config map[string]interface{}
-	if err := json.Unmarshal(file, &config); err != nil { panic(err) }
+	if err := json.Unmarshal(cleanJSON, &config); err != nil {
+		fmt.Printf("❌ Failed to parse base config %s: %v\n", path, err)
+		os.Exit(1)
+	}
 	return config
 }
 
@@ -264,12 +387,13 @@ func addToGitIgnore(workspace string, filename string) {
 	}
 }
 
-func runCommand(name string, args ...string) {
+func runCommand(cwd string, name string, args ...string) {
 	cmd := exec.Command(name, args...)
+	cmd.Dir = cwd
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
-		fmt.Printf("❌ Command failed: %s %v\n", name, args)
+		fmt.Printf("❌ Command failed: %s %v (in %s)\n", name, args, cwd)
 		os.Exit(1)
 	}
 }

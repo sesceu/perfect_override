@@ -83,6 +83,12 @@ You can run the automated end-to-end test suite to verify the tool's functionali
 ./tests/e2e_test.sh
 ```
 
+---
+
+### 🤖 AI-Assisted Setup
+
+Need help creating your `override.json`? Check out [PROMPT.md](file:///usr/local/google/home/sesc/git/perfect_override/PROMPT.md) for a ready-to-use prompt that you can give to an LLM (like Gemini or ChatGPT) to help you tailor your environment.
+
 This test will:
 1. Build the binary.
 2. Launch a sample project with overrides.

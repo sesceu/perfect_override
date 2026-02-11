@@ -18,10 +18,20 @@
 			"git.enabled": false
 		}
 	},
-	"symlinks": [],
-	"aptPackages": [
-		"ripgrep",
-		"fzf",
-		"htop"
+	"symlinks": [
+		{
+			"source": ".bashrc",
+			"target": ".bashrc_custom"
+		}
+	],
+	"aptPackages": {
+		"add": [
+			"ripgrep"
+		],
+		"remove": []
+	},
+	"commands": [
+		"touch /tmp/provision_check",
+		"curl -sS https://starship.rs/install.sh | sh -s -- --yes"
 	]
 }
