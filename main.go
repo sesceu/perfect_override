@@ -12,6 +12,37 @@ import (
 	"strings"
 )
 
+// --- INTERFACES ---
+
+type CommandRunner interface {
+	Run(dir string, name string, args ...string) error
+	RunOutput(dir string, name string, args ...string) (string, error)
+}
+
+type RealCommandRunner struct{}
+
+func (r *RealCommandRunner) Run(dir string, name string, args ...string) error {
+	cmd := exec.Command(name, args...)
+	cmd.Dir = dir
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+func (r *RealCommandRunner) RunOutput(dir string, name string, args ...string) (string, error) {
+	cmd := exec.Command(name, args...)
+	cmd.Dir = dir
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	if err != nil {
+		return stderr.String(), err
+	}
+	return out.String(), nil
+}
+
 // --- CONFIGURATION STRUCTS ---
 
 type PersonalConfig struct {
@@ -48,11 +79,6 @@ type Symlink struct {
 // --- CONSTANTS ---
 const DefaultHostMountPoint = "/host_home"
 
-var (
-	workspaceDir   string
-	devcontainer   string
-	overrideConfig string
-)
 
 func fixRelativePaths(base map[string]interface{}, baseConfigPath string) {
 	build, ok := base["build"].(map[string]interface{})
@@ -71,10 +97,27 @@ func fixRelativePaths(base map[string]interface{}, baseConfigPath string) {
 }
 
 func main() {
-	flag.StringVar(&workspaceDir, "workspace", ".", "Path to the workspace folder")
-	flag.StringVar(&devcontainer, "config", ".devcontainer/devcontainer.json", "Path to the base devcontainer.json")
-	flag.StringVar(&overrideConfig, "override", "override.json", "Path to the override.json config")
-	flag.Parse()
+	if err := Run(&RealCommandRunner{}, os.Args); err != nil {
+		os.Exit(1)
+	}
+}
+
+func Run(runner CommandRunner, args []string) error {
+	// Custom FlagSet to avoid polluting global state and allow testing
+	fs := flag.NewFlagSet("perfect-override", flag.ContinueOnError)
+	var (
+		workspaceDir   string
+		devcontainer   string
+		overrideConfig string
+	)
+	fs.StringVar(&workspaceDir, "workspace", ".", "Path to the workspace folder")
+	fs.StringVar(&devcontainer, "config", ".devcontainer/devcontainer.json", "Path to the base devcontainer.json (relative to workspace)")
+	fs.StringVar(&overrideConfig, "override", "override.json", "Path to the override.json config")
+	
+	// Parse args (excluding program name)
+	if err := fs.Parse(args[1:]); err != nil {
+		return err
+	}
 
 	fmt.Println("🚀 Starting DevContainer Manager...")
 
@@ -87,7 +130,10 @@ func main() {
 	baseMap := loadBaseConfig(baseConfigPath)
 
 	// 2. CHECK ASSUMPTIONS
-	checkAssumptions(baseMap, pConfig)
+	if err := checkAssumptions(baseMap, pConfig); err != nil {
+		fmt.Println(err)
+		return err
+	}
 
 	// 2b. APPLY DYNAMIC NAME
 	folderName := filepath.Base(absWorkspace)
@@ -111,58 +157,58 @@ func main() {
 
 	// 4. LAUNCH CONTAINER
 	fmt.Println("🐳 Launching Container...")
-	runCommand(absWorkspace, "devcontainer", "up",
+	if err := runner.Run(absWorkspace, "devcontainer", "up",
 		"--config", effectiveFile,
 		"--workspace-folder", ".",
-	)
+	); err != nil {
+		fmt.Printf("❌ Container launch failed: %v\n", err)
+		return err
+	}
 
 	// 5. PROVISIONING
 	fmt.Println("⚙️  Provisioning Environment...")
 	
 	if len(pConfig.AptPackages.Add) > 0 || len(pConfig.AptPackages.Remove) > 0 {
-		installAptPackages(pConfig.AptPackages, ".", effectiveFile, absWorkspace)
+		installAptPackages(runner, pConfig.AptPackages, ".", effectiveFile, absWorkspace)
 	}
 
 	if len(pConfig.Commands) > 0 {
-		runCustomCommands(pConfig.Commands, ".", effectiveFile, absWorkspace)
+		runCustomCommands(runner, pConfig.Commands, ".", effectiveFile, absWorkspace)
 	}
 
 	// PATCH SETTINGS (Read -> Modify -> Write)
-	patchMachineSettings(pConfig, pConfig.Checks.ExpectedRemoteUser, ".", effectiveFile, absWorkspace)
+	patchMachineSettings(runner, pConfig, pConfig.Checks.ExpectedRemoteUser, ".", effectiveFile, absWorkspace)
 
 	// CREATE SYMLINKS
-	createSymlinks(pConfig, pConfig.Checks.ExpectedHomeDir, ".", effectiveFile, absWorkspace)
+	createSymlinks(runner, pConfig, pConfig.Checks.ExpectedHomeDir, ".", effectiveFile, absWorkspace)
 
 	// 6. CLEANUP (Zero Trace)
 	fmt.Println("🧹 Cleaning up temporary config...")
 	_ = os.Remove(effectivePath)
 
-	fmt.Println("✅ DONE! Connect to Port 2222.")
+	fmt.Println("✅ DONE!")
+	return nil
 }
 
 // --- CORE LOGIC ---
 
-func patchMachineSettings(pConfig PersonalConfig, user string, workspace string, config string, cwd string) {
+func patchMachineSettings(runner CommandRunner, pConfig PersonalConfig, user string, workspace string, config string, cwd string) {
 	targetDir := fmt.Sprintf("/home/%s/.vscode-server/data/Machine", user)
 	targetFile := filepath.Join(targetDir, "settings.json")
 
 	fmt.Println("📝 Patching VS Code settings...")
 
 	// A. Ensure Dir Exists
-	runCommand(cwd, "devcontainer", "exec", "--config", config, "--workspace-folder", workspace, "mkdir", "-p", targetDir)
+	runner.Run(cwd, "devcontainer", "exec", "--config", config, "--workspace-folder", workspace, "mkdir", "-p", targetDir)
 
 	// B. Read Existing Settings (if any)
 	// We use 'cat' via exec. If file fails, we assume empty JSON object.
-	cmd := exec.Command("devcontainer", "exec", "--config", config, "--workspace-folder", workspace, "cat", targetFile)
-	cmd.Dir = cwd
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	_ = cmd.Run() // Ignore error (file might not exist)
+	out, _ := runner.RunOutput(cwd, "devcontainer", "exec", "--config", config, "--workspace-folder", workspace, "cat", targetFile)
 
 	currentSettings := make(map[string]interface{})
-	if out.Len() > 0 {
+	if len(out) > 0 {
 		// Try to parse existing. If fail (e.g. valid json but empty), start fresh.
-		_ = json.Unmarshal(out.Bytes(), &currentSettings)
+		_ = json.Unmarshal([]byte(out), &currentSettings)
 	}
 
 	// C. Apply Removals
@@ -178,10 +224,10 @@ func patchMachineSettings(pConfig PersonalConfig, user string, workspace string,
 	// E. Write Back
 	jsonBytes, _ := json.MarshalIndent(currentSettings, "", "  ")
 	writeCmd := fmt.Sprintf("cat > %s <<EOF\n%s\nEOF", targetFile, string(jsonBytes))
-	runCommand(cwd, "devcontainer", "exec", "--config", config, "--workspace-folder", workspace, "bash", "-c", writeCmd)
+	runner.Run(cwd, "devcontainer", "exec", "--config", config, "--workspace-folder", workspace, "bash", "-c", writeCmd)
 }
 
-func createSymlinks(pConfig PersonalConfig, homeDir string, workspace string, config string, cwd string) {
+func createSymlinks(runner CommandRunner, pConfig PersonalConfig, homeDir string, workspace string, config string, cwd string) {
 	mountPoint := pConfig.HostHomeMount
 	if mountPoint == "" {
 		mountPoint = DefaultHostMountPoint
@@ -205,18 +251,13 @@ func createSymlinks(pConfig PersonalConfig, homeDir string, workspace string, co
 		)
 		
 		// Capture output to check for "Read-only file system"
-		cmd := exec.Command("devcontainer", "exec", "--config", config, "--workspace-folder", workspace, "bash", "-c", script)
-		cmd.Dir = cwd
-		var stderr bytes.Buffer
-		cmd.Stderr = &stderr
-		err := cmd.Run()
+		stderr, err := runner.RunOutput(cwd, "devcontainer", "exec", "--config", config, "--workspace-folder", workspace, "bash", "-c", script)
 
 		if err != nil {
-			errStr := stderr.String()
-			if strings.Contains(errStr, "Read-only file system") {
+			if strings.Contains(stderr, "Read-only file system") {
 				fmt.Printf("⚠️  Warning: Could not create symlink %s (Read-only file system). Skipping.\n", link.Target)
 			} else {
-				fmt.Printf("❌ Failed to create symlink %s: %v\n%s\n", link.Target, err, errStr)
+				fmt.Printf("❌ Failed to create symlink %s: %v\n%s\n", link.Target, err, stderr)
 				// We don't exit here to allow other provisioning to potentially succeed
 			}
 		}
@@ -289,40 +330,39 @@ func injectHostMount(base map[string]interface{}, pConfig PersonalConfig) {
 	base["mounts"] = mounts
 }
 
-func checkAssumptions(base map[string]interface{}, pConfig PersonalConfig) {
+func checkAssumptions(base map[string]interface{}, pConfig PersonalConfig) error {
 	remoteUser, ok := base["remoteUser"].(string)
-	if !ok { return } // If not defined, we can't check.
+	if !ok { return nil } // If not defined, we can't check.
 	
 	if remoteUser != pConfig.Checks.ExpectedRemoteUser {
-		fmt.Printf("❌ Safety Check Failed!\nExpected remoteUser: '%s'\nFound in config:   '%s'\n", pConfig.Checks.ExpectedRemoteUser, remoteUser)
-		fmt.Println("Update personal-config.json or the devcontainer.json to match.")
-		os.Exit(1)
+		return fmt.Errorf("❌ Safety Check Failed!\nExpected remoteUser: '%s'\nFound in config:   '%s'\nUpdate personal-config.json or the devcontainer.json to match.", pConfig.Checks.ExpectedRemoteUser, remoteUser)
 	}
+	return nil
 }
 
-func installAptPackages(apt struct {
+func installAptPackages(runner CommandRunner, apt struct {
 	Add    []string `json:"add"`
 	Remove []string `json:"remove"`
 }, workspace string, config string, cwd string) {
 	if len(apt.Remove) > 0 {
-		fmt.Printf("�️ Removing packages: %v\n", apt.Remove)
+		fmt.Printf("️ Removing packages: %v\n", apt.Remove)
 		pkgList := strings.Join(apt.Remove, " ")
 		script := fmt.Sprintf("sudo apt-get remove -y %s", pkgList)
-		runCommand(cwd, "devcontainer", "exec", "--config", config, "--workspace-folder", workspace, "bash", "-c", script)
+		runner.Run(cwd, "devcontainer", "exec", "--config", config, "--workspace-folder", workspace, "bash", "-c", script)
 	}
 	if len(apt.Add) > 0 {
-		fmt.Printf("�📦 Installing packages: %v\n", apt.Add)
+		fmt.Printf("📦 Installing packages: %v\n", apt.Add)
 		pkgList := strings.Join(apt.Add, " ")
 		script := fmt.Sprintf("sudo apt-get update && sudo apt-get install -y %s", pkgList)
-		runCommand(cwd, "devcontainer", "exec", "--config", config, "--workspace-folder", workspace, "bash", "-c", script)
+		runner.Run(cwd, "devcontainer", "exec", "--config", config, "--workspace-folder", workspace, "bash", "-c", script)
 	}
 }
 
-func runCustomCommands(commands []string, workspace string, config string, cwd string) {
+func runCustomCommands(runner CommandRunner, commands []string, workspace string, config string, cwd string) {
 	fmt.Println("🛠️ Running custom commands...")
 	for _, cmd := range commands {
 		fmt.Printf("  > %s\n", cmd)
-		runCommand(cwd, "devcontainer", "exec", "--config", config, "--workspace-folder", workspace, "bash", "-c", cmd)
+		runner.Run(cwd, "devcontainer", "exec", "--config", config, "--workspace-folder", workspace, "bash", "-c", cmd)
 	}
 }
 
