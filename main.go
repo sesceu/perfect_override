@@ -151,6 +151,7 @@ func Run(runner CommandRunner, args []string) error {
 	fixRelativePaths(baseMap, baseConfigPath)
 	applyExtensionChanges(baseMap, pConfig)
 	applyFeatureChanges(baseMap, pConfig)
+	applySettingsChanges(baseMap, pConfig)
 	injectHostMount(baseMap, pConfig)
 	saveJSON(effectivePath, baseMap)
 	addToGitIgnore(absWorkspace, effectiveFile)
@@ -176,9 +177,6 @@ func Run(runner CommandRunner, args []string) error {
 		runCustomCommands(runner, pConfig.Commands, ".", effectiveFile, absWorkspace)
 	}
 
-	// PATCH SETTINGS (Read -> Modify -> Write)
-	patchMachineSettings(runner, pConfig, pConfig.Checks.ExpectedRemoteUser, ".", effectiveFile, absWorkspace)
-
 	// CREATE SYMLINKS
 	createSymlinks(runner, pConfig, pConfig.Checks.ExpectedHomeDir, ".", effectiveFile, absWorkspace)
 
@@ -192,39 +190,34 @@ func Run(runner CommandRunner, args []string) error {
 
 // --- CORE LOGIC ---
 
-func patchMachineSettings(runner CommandRunner, pConfig PersonalConfig, user string, workspace string, config string, cwd string) {
-	targetDir := fmt.Sprintf("/home/%s/.vscode-server/data/Machine", user)
-	targetFile := filepath.Join(targetDir, "settings.json")
-
-	fmt.Println("📝 Patching VS Code settings...")
-
-	// A. Ensure Dir Exists
-	runner.Run(cwd, "devcontainer", "exec", "--config", config, "--workspace-folder", workspace, "mkdir", "-p", targetDir)
-
-	// B. Read Existing Settings (if any)
-	// We use 'cat' via exec. If file fails, we assume empty JSON object.
-	out, _ := runner.RunOutput(cwd, "devcontainer", "exec", "--config", config, "--workspace-folder", workspace, "cat", targetFile)
-
-	currentSettings := make(map[string]interface{})
-	if len(out) > 0 {
-		// Try to parse existing. If fail (e.g. valid json but empty), start fresh.
-		_ = json.Unmarshal([]byte(out), &currentSettings)
+func applySettingsChanges(base map[string]interface{}, pConfig PersonalConfig) {
+	// Initialize map structure if missing
+	customizations, _ := base["customizations"].(map[string]interface{})
+	if customizations == nil {
+		customizations = make(map[string]interface{})
+		base["customizations"] = customizations
+	}
+	vscode, _ := customizations["vscode"].(map[string]interface{})
+	if vscode == nil {
+		vscode = make(map[string]interface{})
+		customizations["vscode"] = vscode
 	}
 
-	// C. Apply Removals
+	settings, _ := vscode["settings"].(map[string]interface{})
+	if settings == nil {
+		settings = make(map[string]interface{})
+		vscode["settings"] = settings
+	}
+
+	// Apply removals
 	for _, key := range pConfig.Settings.Remove {
-		delete(currentSettings, key)
+		delete(settings, key)
 	}
 
-	// D. Apply Adds (Upsert)
+	// Apply adds/overrides
 	for key, val := range pConfig.Settings.Add {
-		currentSettings[key] = val
+		settings[key] = val
 	}
-
-	// E. Write Back
-	jsonBytes, _ := json.MarshalIndent(currentSettings, "", "  ")
-	writeCmd := fmt.Sprintf("cat > %s <<EOF\n%s\nEOF", targetFile, string(jsonBytes))
-	runner.Run(cwd, "devcontainer", "exec", "--config", config, "--workspace-folder", workspace, "bash", "-c", writeCmd)
 }
 
 func createSymlinks(runner CommandRunner, pConfig PersonalConfig, homeDir string, workspace string, config string, cwd string) {

@@ -67,15 +67,6 @@ func TestRun(t *testing.T) {
 	os.WriteFile(filepath.Join(tmpDir, "override.json"), []byte(overrideConfig), 0644)
 
 	mock := &MockCommandRunner{}
-	
-	// Mock rules to handle specific interactions
-	mock.Rule = func(dir, name string, args ...string) (string, error) {
-		// Mock settings read (cat)
-		if len(args) > 0 && args[0] == "exec" && args[len(args)-2] == "cat" {
-			return "{}", nil
-		}
-		return "", nil
-	}
 
 	// EXECUTE RUN
 	args := []string{"perfect-override", "--workspace", tmpDir, "--override", filepath.Join(tmpDir, "override.json")}
@@ -90,9 +81,9 @@ func TestRun(t *testing.T) {
 	}
 	
 	// Check Captured Commands
-	// We expect commands for: devcontainer up, apt-get install, custom echo, mkdir, patch settings, symlink, cleanup
-	if len(mock.CapturedCmds) < 5 {
-		t.Errorf("Expected at least 5 commands, got %d:\n%v", len(mock.CapturedCmds), mock.CapturedCmds)
+	// We expect commands for: devcontainer up, apt-get install, custom echo, symlink
+	if len(mock.CapturedCmds) < 4 {
+		t.Errorf("Expected at least 4 commands, got %d:\n%v", len(mock.CapturedCmds), mock.CapturedCmds)
 	}
 	
 	// Helper to check for command presence
@@ -202,35 +193,72 @@ func TestRunCustomCommands(t *testing.T) {
 	}
 }
 
-func TestPatchMachineSettings(t *testing.T) {
-	mock := &MockCommandRunner{}
-	pConfig := PersonalConfig{}
-	pConfig.Settings.Add = map[string]interface{}{"editor.formatOnSave": true}
-	pConfig.Settings.Remove = []string{"git.enabled"}
-
-	// Mocking output for 'cat' command to simulate existing settings
-	mock.Rule = func(dir, name string, args ...string) (string, error) {
-		if len(args) > 0 && args[len(args)-1] == "/home/vscode/.vscode-server/data/Machine/settings.json" {
-			// Return existing JSON
-			return `{"git.enabled": true, "files.autoSave": "off"}`, nil
-		}
-		return "", nil
+func TestApplySettingsChanges(t *testing.T) {
+	tests := []struct {
+		name     string
+		base     map[string]interface{}
+		pConfig  PersonalConfig
+		expected map[string]interface{}
+	}{
+		{
+			name: "Add and Remove Settings",
+			base: map[string]interface{}{
+				"customizations": map[string]interface{}{
+					"vscode": map[string]interface{}{
+						"settings": map[string]interface{}{
+							"existingSetting": "keep",
+							"removeSetting":   true,
+						},
+					},
+				},
+			},
+			pConfig: PersonalConfig{
+				Settings: struct {
+					Add    map[string]interface{} `json:"add"`
+					Remove []string               `json:"remove"`
+				}{
+					Add: map[string]interface{}{
+						"newSetting": 123,
+					},
+					Remove: []string{"removeSetting"},
+				},
+			},
+			expected: map[string]interface{}{
+				"existingSetting": "keep",
+				"newSetting":      123,
+			},
+		},
+		{
+			name: "Empty Base Settings",
+			base: map[string]interface{}{},
+			pConfig: PersonalConfig{
+				Settings: struct {
+					Add    map[string]interface{} `json:"add"`
+					Remove []string               `json:"remove"`
+				}{
+					Add: map[string]interface{}{
+						"newSetting": 123,
+					},
+				},
+			},
+			expected: map[string]interface{}{
+				"newSetting": 123,
+			},
+		},
 	}
 
-	patchMachineSettings(mock, pConfig, "vscode", ".", "config.json", "/abs/work")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			applySettingsChanges(tt.base, tt.pConfig)
 
-	// We expect 3 commands: mkdir, cat (read), bash (write)
-	if len(mock.CapturedCmds) != 3 {
-		t.Errorf("Expected 3 commands, got %d", len(mock.CapturedCmds))
-	}
+			customizations := tt.base["customizations"].(map[string]interface{})
+			vscode := customizations["vscode"].(map[string]interface{})
+			settings := vscode["settings"].(map[string]interface{})
 
-	// Verify Write Command Content
-	writeCmd := mock.CapturedCmds[2]
-	if !containsStr(writeCmd, "editor.formatOnSave") || !containsStr(writeCmd, "files.autoSave") {
-		t.Errorf("Write command missing expected settings: %s", writeCmd)
-	}
-	if containsStr(writeCmd, "git.enabled") {
-		t.Errorf("Write command should NOT contain removed setting: %s", writeCmd)
+			if !reflect.DeepEqual(settings, tt.expected) {
+				t.Errorf("expected %v, got %v", tt.expected, settings)
+			}
+		})
 	}
 }
 
