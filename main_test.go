@@ -74,8 +74,8 @@ func TestRun(t *testing.T) {
 		t.Fatalf("Run failed: %v", err)
 	}
 
-	// Verify Effective Config was created
-	effectivePath := filepath.Join(tmpDir, ".devcontainer.json")
+	// Verify Effective Config was correctly placed inside .devcontainer folder
+	effectivePath := filepath.Join(tmpDir, ".devcontainer", ".devcontainer.json")
 	if _, err := os.Stat(effectivePath); err == nil {
 		t.Errorf("Effective config should have been cleaned up!")
 	}
@@ -516,48 +516,7 @@ func TestInjectHostMount(t *testing.T) {
 	}
 }
 
-func TestFixRelativePaths(t *testing.T) {
-	tests := []struct {
-		name           string
-		base           map[string]interface{}
-		baseConfigPath string
-		expectedPath   string
-	}{
-		{
-			name: "Relative path",
-			base: map[string]interface{}{
-				"build": map[string]interface{}{
-					"dockerfile": "Dockerfile",
-				},
-			},
-			baseConfigPath: "/abs/path/to/.devcontainer/devcontainer.json",
-			expectedPath:   "/abs/path/to/.devcontainer/Dockerfile",
-		},
-		{
-			name: "Absolute path (unchanged)",
-			base: map[string]interface{}{
-				"build": map[string]interface{}{
-					"dockerfile": "/abs/Dockerfile",
-				},
-			},
-			baseConfigPath: "/abs/path/to/.devcontainer/devcontainer.json",
-			expectedPath:   "/abs/Dockerfile",
-		},
-	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			fixRelativePaths(tt.base, tt.baseConfigPath)
-			
-			build := tt.base["build"].(map[string]interface{})
-			dockerfile := build["dockerfile"].(string)
-
-			if dockerfile != tt.expectedPath {
-				t.Errorf("expected %s, got %s", tt.expectedPath, dockerfile)
-			}
-		})
-	}
-}
 
 func TestConfigLoadFailures(t *testing.T) {
 	// Test loadPersonalConfig valid and invalid

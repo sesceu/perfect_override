@@ -80,21 +80,6 @@ type Symlink struct {
 const DefaultHostMountPoint = "/host_home"
 
 
-func fixRelativePaths(base map[string]interface{}, baseConfigPath string) {
-	build, ok := base["build"].(map[string]interface{})
-	if !ok { return }
-	
-	dockerfile, ok := build["dockerfile"].(string)
-	if !ok { return }
-	
-	if !filepath.IsAbs(dockerfile) {
-		absConfigPath, _ := filepath.Abs(baseConfigPath)
-		// The dockerfile path in devcontainer.json is relative to the config file itself.
-		absDockerfile := filepath.Join(filepath.Dir(absConfigPath), dockerfile)
-		build["dockerfile"] = absDockerfile
-		fmt.Printf("📍 Absolutized Dockerfile: %s\n", absDockerfile)
-	}
-}
 
 func main() {
 	if err := Run(&RealCommandRunner{}, os.Args); err != nil {
@@ -142,24 +127,29 @@ func Run(runner CommandRunner, args []string) error {
 	fmt.Printf("🏷️  Container Name: %s\n", effectiveName)
 
 	// 3. PREPARE EFFECTIVE CONFIG
-	// Note: The devcontainer CLI is extremely strict: the config MUST be named 
+	// The devcontainer CLI is extremely strict: the config MUST be named 
 	// 'devcontainer.json' or '.devcontainer.json'. 
-	// To preserve the corporate file, we use '.devcontainer.json' at the workspace root.
+	// To preserve the context paths and native .dockerignore behavior, we write 
+	// the overlay file completely adjacent to the base config file. 
+	// If the base is .devcontainer/devcontainer.json, our effective file becomes .devcontainer/.devcontainer.json
+	baseConfigDir := filepath.Dir(baseConfigPath)
 	effectiveFile := ".devcontainer.json"
-	effectivePath := filepath.Join(absWorkspace, effectiveFile)
+	effectivePath := filepath.Join(baseConfigDir, effectiveFile)
 	
-	fixRelativePaths(baseMap, baseConfigPath)
+	// We need the relative path from the workspace for the --config flag
+	relEffectivePath, _ := filepath.Rel(absWorkspace, effectivePath)
+	
 	applyExtensionChanges(baseMap, pConfig)
 	applyFeatureChanges(baseMap, pConfig)
 	applySettingsChanges(baseMap, pConfig)
 	injectHostMount(baseMap, pConfig)
 	saveJSON(effectivePath, baseMap)
-	addToGitIgnore(absWorkspace, effectiveFile)
+	addToGitIgnore(absWorkspace, relEffectivePath)
 
 	// 4. LAUNCH CONTAINER
 	fmt.Println("🐳 Launching Container...")
 	if err := runner.Run(absWorkspace, "devcontainer", "up",
-		"--config", effectiveFile,
+		"--config", relEffectivePath,
 		"--workspace-folder", ".",
 	); err != nil {
 		fmt.Printf("❌ Container launch failed: %v\n", err)
@@ -170,15 +160,15 @@ func Run(runner CommandRunner, args []string) error {
 	fmt.Println("⚙️  Provisioning Environment...")
 	
 	if len(pConfig.AptPackages.Add) > 0 || len(pConfig.AptPackages.Remove) > 0 {
-		installAptPackages(runner, pConfig.AptPackages, ".", effectiveFile, absWorkspace)
+		installAptPackages(runner, pConfig.AptPackages, ".", relEffectivePath, absWorkspace)
 	}
 
 	if len(pConfig.Commands) > 0 {
-		runCustomCommands(runner, pConfig.Commands, ".", effectiveFile, absWorkspace)
+		runCustomCommands(runner, pConfig.Commands, ".", relEffectivePath, absWorkspace)
 	}
 
 	// CREATE SYMLINKS
-	createSymlinks(runner, pConfig, pConfig.Checks.ExpectedHomeDir, ".", effectiveFile, absWorkspace)
+	createSymlinks(runner, pConfig, pConfig.Checks.ExpectedHomeDir, ".", relEffectivePath, absWorkspace)
 
 	// 6. CLEANUP (Zero Trace)
 	fmt.Println("🧹 Cleaning up temporary config...")
