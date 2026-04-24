@@ -29,7 +29,7 @@ Perfect Override is a single Go binary that:
 2.  Reads your `override.json`.
 3.  Merges them in memory (handling Arrays and Objects intelligently).
 4.  Generates a `.devcontainer.json` (git-ignored).
-5.  Launches the container using `devcontainer up` (run `npm install -g @devcontainers/cli` to install).
+5.  Launches the container using `devcontainer up`
 6.  Provisions the running container (installs APT packages, symlinks dotfiles, injects settings).
 
 ## 🚀 Getting Started
@@ -41,12 +41,15 @@ Build the binary from source:
 > [!TIP]
 > Check the `samples/` directory for a complete example of a corporate setup with personal overrides.
 
-> [!TIP]
-> Check the `samples/` directory for a complete example of a corporate setup with personal overrides.
-
 ```bash
 # In this directory
 go build -o perfect-override main.go
+```
+
+Install the devcontainer CLI tool:
+
+```bash
+npm install -g @devcontainers/cli
 ```
 
 ### 2. Launching
